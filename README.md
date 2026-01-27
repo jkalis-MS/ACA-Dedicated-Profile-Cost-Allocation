@@ -116,24 +116,6 @@ The script:
 - Multi-profile cost allocation with SKU weighting  
 - CSV export and configurable formulas  
 
-**Phase 2** (Planned)  
-- Azure Cost Management API integration  
-- Actual dollar amounts  
-- Multi-environment analysis  
-
-**Phase 3** (Future)  
-- Grafana dashboards  
-- Power BI templates  
-- Azure Automation scheduling  
-
-## Contributing
-
-Contributions welcome! Areas for improvement:
-- Cost Management API integration
-- Additional metrics (network, storage)
-- Visualization improvements
-- Unit tests
-
 ## License
 
 MIT License
