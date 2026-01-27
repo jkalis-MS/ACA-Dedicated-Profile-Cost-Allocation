@@ -41,18 +41,6 @@ az login
     -ResourceGroupName "your-resource-group" `
     -EnvironmentName "your-container-app-env"
 ```
-
-### Custom Time Range
-
-```powershell
-.\Get-ACAEnvironmentCostBreakdown.ps1 `
-    -SubscriptionId $subId `
-    -ResourceGroupName $rg `
-    -EnvironmentName $env `
-    -StartDate (Get-Date).AddDays(-7) `
-    -EndDate (Get-Date)
-```
-
 ### Custom Allocation Weights
 ```powershell
 # CPU-heavy weighting
@@ -106,9 +94,8 @@ The script:
 
 ## Limitations
 
-- **Percentages only** - No direct dollar amounts (Azure Cost Management API integration planned for Phase 2)
+- **Percentages only** - No direct dollar amounts
 - **Dedicated profiles only** - Consumption profiles billed separately per-replica
-- **93-day metric retention** - Azure Monitor limitation
 
 ## Roadmap
 
