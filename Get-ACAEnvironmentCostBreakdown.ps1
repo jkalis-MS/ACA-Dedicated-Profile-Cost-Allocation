@@ -1,0 +1,549 @@
+<#
+.SYNOPSIS
+    Calculates cost breakdown by Container App across shared Dedicated Workload Profiles
+    
+.DESCRIPTION
+    This script analyzes Azure Container Apps running on Dedicated Workload Profiles within
+    a Container Apps Environment and calculates the percentage of cost attributable to each app
+    based on actual resource usage (CPU, memory) and replica runtime.
+    
+.PARAMETER SubscriptionId
+    Azure Subscription ID containing the Container Apps Environment
+    
+.PARAMETER ResourceGroupName
+    Resource Group name containing the Container Apps Environment
+    
+.PARAMETER EnvironmentName
+    Name of the Container Apps Environment to analyze
+    
+.PARAMETER StartDate
+    Start date for metric collection (default: 24 hours ago)
+    
+.PARAMETER EndDate
+    End date for metric collection (default: now)
+    
+.PARAMETER CpuWeight
+    Weight for CPU usage in allocation formula (default: 0.6)
+    
+.PARAMETER MemoryWeight
+    Weight for memory usage in allocation formula (default: 0.3)
+    
+.PARAMETER ReplicaTimeWeight
+    Weight for replica runtime in allocation formula (default: 0.1)
+    
+.PARAMETER OutputPath
+    Path for output CSV file (default: current directory)
+    
+.EXAMPLE
+    .\Get-ACAEnvironmentCostBreakdown.ps1 -SubscriptionId "xxxx" -ResourceGroupName "myRG" -EnvironmentName "myEnv"
+    
+.EXAMPLE
+    .\Get-ACAEnvironmentCostBreakdown.ps1 -SubscriptionId "xxxx" -ResourceGroupName "myRG" -EnvironmentName "myEnv" -StartDate (Get-Date).AddDays(-7)
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$SubscriptionId,
+    
+    [Parameter(Mandatory = $true)]
+    [string]$ResourceGroupName,
+    
+    [Parameter(Mandatory = $true)]
+    [string]$EnvironmentName,
+    
+    [Parameter(Mandatory = $false)]
+    [DateTime]$StartDate = (Get-Date).AddHours(-24),
+    
+    [Parameter(Mandatory = $false)]
+    [DateTime]$EndDate = (Get-Date),
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 1)]
+    [double]$CpuWeight = 0.6,
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 1)]
+    [double]$MemoryWeight = 0.3,
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 1)]
+    [double]$ReplicaTimeWeight = 0.1,
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$OnlyDedicated = $true,
+    
+    [Parameter(Mandatory = $false)]
+    [string]$OutputPath = "."
+)
+
+$ErrorActionPreference = "Stop"
+
+# Check for required modules
+if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
+    Write-Host "ERROR: Az.Accounts module is not installed." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Please install it using one of these methods:" -ForegroundColor Yellow
+    Write-Host "  Option 1: Install-Module -Name Az.Accounts -Scope CurrentUser -Force" -ForegroundColor Cyan
+    Write-Host "  Option 2: Install-Module -Name Az -Scope CurrentUser -Force" -ForegroundColor Cyan
+    Write-Host ""
+    exit 1
+}
+
+# Workload Profile relative cost weights (normalized to D4 = 1.0, region-agnostic)
+# Based on Azure pricing: cost scales with vCPU count, E-series has memory premium
+$workloadProfileCostWeights = @{
+    "D4"  = 1.00
+    "D8"  = 2.00
+    "D16" = 4.00
+    "D32" = 8.00
+    "E4"  = 1.26
+    "E8"  = 2.52
+    "E16" = 5.04
+    "E32" = 10.07
+    "Consumption" = 0  # Consumption billed separately per replica
+}
+
+function Get-ProfileCostWeight {
+    param(
+        [string]$ProfileType
+    )
+    
+    # Use workloadProfileType directly - it's always populated correctly from az containerapp env show
+    if ($workloadProfileCostWeights.ContainsKey($ProfileType)) {
+        return $workloadProfileCostWeights[$ProfileType]
+    }
+    
+    # Return null if SKU not recognized
+    return $null
+}
+
+# Validate weights sum to 1.0
+$totalWeight = $CpuWeight + $MemoryWeight + $ReplicaTimeWeight
+if ([Math]::Abs($totalWeight - 1.0) -gt 0.001) {
+    Write-Error "Weights must sum to 1.0. Current sum: $totalWeight"
+    exit 1
+}
+
+Write-Host "===== Azure Container Apps Cost Breakdown Tool =====" -ForegroundColor Cyan
+Write-Host "Subscription: $SubscriptionId" -ForegroundColor Gray
+Write-Host "Resource Group: $ResourceGroupName" -ForegroundColor Gray
+Write-Host "Environment: $EnvironmentName" -ForegroundColor Gray
+Write-Host "Analysis Period: $($StartDate.ToString('yyyy-MM-dd HH:mm')) to $($EndDate.ToString('yyyy-MM-dd HH:mm'))" -ForegroundColor Gray
+Write-Host "Allocation Weights: CPU=$CpuWeight, Memory=$MemoryWeight, ReplicaTime=$ReplicaTimeWeight" -ForegroundColor Gray
+Write-Host "Analyze Only Dedicated Profiles: $OnlyDedicated" -ForegroundColor Gray
+Write-Host ""
+
+# Import helper functions
+. "$PSScriptRoot\Scripts\ACAMetricsHelper.ps1"
+
+# Step 1: Set Azure context
+Write-Host "[1/7] Setting Azure subscription context..." -ForegroundColor Yellow
+try {
+    # Try Azure CLI first (works better with conditional access policies)
+    $cliAccount = az account show 2>$null | ConvertFrom-Json
+    
+    if ($cliAccount) {
+        # Azure CLI is authenticated, set the subscription
+        az account set --subscription $SubscriptionId 2>$null | Out-Null
+        $verifyAccount = az account show | ConvertFrom-Json
+        Write-Host "   ✓ Connected via Azure CLI to subscription: $($verifyAccount.name)" -ForegroundColor Green
+    } else {
+        # Fall back to Az PowerShell if Azure CLI not available
+        $context = Get-AzContext
+        if (-not $context) {
+            Write-Host "   Not logged in. Please run one of:" -ForegroundColor Red
+            Write-Host "     - az login" -ForegroundColor Yellow
+            Write-Host "     - Connect-AzAccount" -ForegroundColor Yellow
+            exit 1
+        }
+        
+        Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+        Write-Host "   ✓ Connected via Az PowerShell to subscription: $($context.Subscription.Name)" -ForegroundColor Green
+    }
+} catch {
+    Write-Error "Failed to set Azure context: $_"
+    exit 1
+}
+
+# Step 2: Get Container Apps Environment
+Write-Host "[2/7] Retrieving Container Apps Environment details..." -ForegroundColor Yellow
+$envResourceId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.App/managedEnvironments/$EnvironmentName"
+
+try {
+    $environment = az containerapp env show `
+        --name $EnvironmentName `
+        --resource-group $ResourceGroupName `
+        --subscription $SubscriptionId `
+        --output json | ConvertFrom-Json
+    
+    if (-not $environment) {
+        Write-Error "Environment not found: $EnvironmentName"
+        exit 1
+    }
+    
+    Write-Host "   ✓ Environment: $($environment.name)" -ForegroundColor Green
+    Write-Host "   Location: $($environment.location)" -ForegroundColor Gray
+} catch {
+    Write-Error "Failed to retrieve environment: $_"
+    exit 1
+}
+
+# Step 3: Get Workload Profiles (from environment object)
+Write-Host "[3/7] Retrieving Workload Profiles..." -ForegroundColor Yellow
+try {
+    # Extract workload profiles from the environment object we already fetched
+    $workloadProfiles = $environment.properties.workloadProfiles
+    
+    if (-not $workloadProfiles -or $workloadProfiles.Count -eq 0) {
+        Write-Error "No workload profiles found in environment: $EnvironmentName"
+        exit 1
+    }
+    
+    # Filter profiles based on OnlyDedicated setting
+    if ($OnlyDedicated) {
+        # Exclude Consumption profiles - only analyze Dedicated profiles
+        # Note: Consumption profile name is always "Consumption", dedicated profiles have custom names
+        $dedicatedProfiles = $workloadProfiles | Where-Object { 
+            $_.name -ne "Consumption" -and 
+            $_.workloadProfileType -ne "Consumption"
+        }
+        
+        if ($dedicatedProfiles.Count -eq 0) {
+            Write-Warning "No dedicated workload profiles found in this environment."
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "This environment uses only Consumption profiles, which are billed per-replica." -ForegroundColor Yellow
+            Write-Host "Cost allocation is not needed for Consumption profiles as they have individual pricing in Azure billing." -ForegroundColor Yellow
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "To analyze Consumption profiles anyway, run with: -OnlyDedicated:`$false" -ForegroundColor Gray
+            exit 0
+        }
+    } else {
+        # Analyze all profiles
+        $dedicatedProfiles = $workloadProfiles
+    }
+    
+    Write-Host "   ✓ Found $($dedicatedProfiles.Count) dedicated workload profile(s):" -ForegroundColor Green
+    
+    foreach ($profile in $dedicatedProfiles) {
+        $profileType = $profile.workloadProfileType
+        $profileName = $profile.name
+        $costWeight = Get-ProfileCostWeight -ProfileType $profileType
+        
+        if ($null -eq $costWeight) {
+            Write-Warning "Unknown workload profile type '$profileType' for profile '$profileName'. Skipping this profile."
+            continue
+        }
+        
+        $minNodes = if ($profile.minimumCount) { $profile.minimumCount } else { "" }
+        $maxNodes = if ($profile.maximumCount) { $profile.maximumCount } else { "" }
+        Write-Host "     - $profileName`: $profileType (Min: $minNodes, Max: $maxNodes, Cost Weight: $costWeight)" -ForegroundColor Gray
+    }
+} catch {
+    Write-Error "Failed to retrieve workload profiles: $_"
+    exit 1
+}
+
+# Step 4: Get Container Apps
+Write-Host "[4/7] Retrieving Container Apps..." -ForegroundColor Yellow
+try {
+    $allApps = az containerapp list `
+        --resource-group $ResourceGroupName `
+        --subscription $SubscriptionId `
+        --output json | ConvertFrom-Json
+    
+    # Filter apps in this environment and using targeted profiles
+    $appsInEnv = $allApps | Where-Object { 
+        $_.properties.environmentId -eq $environment.id
+    }
+    
+    $appsOnDedicated = $appsInEnv | Where-Object {
+        $profileName = $_.properties.workloadProfileName
+        $profileName -and ($dedicatedProfiles.name -contains $profileName)
+    }
+    
+    if ($appsOnDedicated.Count -eq 0) {
+        Write-Host "" -ForegroundColor Yellow
+        Write-Warning "No container apps found running on the targeted workload profiles."
+        Write-Host "" -ForegroundColor Yellow
+        
+        # Check if there are dedicated profiles without apps
+        if ($OnlyDedicated -and $dedicatedProfiles.Count -gt 0) {
+            Write-Host "⚠️  COST WARNING: Unused Dedicated Workload Profiles" -ForegroundColor Red
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "The following dedicated workload profiles are running but have NO applications:" -ForegroundColor Yellow
+            Write-Host "" -ForegroundColor Yellow
+            
+            foreach ($profile in $dedicatedProfiles) {
+                $profileType = $profile.workloadProfileType
+                $profileName = $profile.name
+                $costWeight = Get-ProfileCostWeight -ProfileType $profileType
+                
+                if ($null -eq $costWeight) {
+                    Write-Warning "Unknown workload profile type '$profileType' for profile '$profileName'. Skipping."
+                    continue
+                }
+                
+                Write-Host "  \U0001F4CA Profile: $profileName" -ForegroundColor White
+                Write-Host "     SKU: $profileType (Cost Weight: $costWeight)" -ForegroundColor Gray
+                Write-Host "     Status: Running with 0 applications" -ForegroundColor Red
+                Write-Host "     Impact: You are paying for this dedicated profile even though no apps are using it." -ForegroundColor Yellow
+                Write-Host "" -ForegroundColor Yellow
+            }
+            
+            Write-Host "💡 Recommendation: Remove unused dedicated workload profiles to reduce costs." -ForegroundColor Cyan
+            Write-Host "   Use: az containerapp env workload-profile delete --name <profile-name> --resource-group $ResourceGroupName --environment-name $EnvironmentName" -ForegroundColor Gray
+        }
+        
+        Write-Host "" -ForegroundColor Yellow
+        exit 0
+    }
+    
+    Write-Host "   ✓ Found $($appsOnDedicated.Count) app(s) on dedicated profiles:" -ForegroundColor Green
+    foreach ($app in $appsOnDedicated) {
+        $profileName = $app.properties.workloadProfileName
+        Write-Host "     - $($app.name): Profile=$profileName" -ForegroundColor Gray
+    }
+} catch {
+    Write-Error "Failed to retrieve container apps: $_"
+    exit 1
+}
+
+# Step 5: Collect Metrics
+Write-Host "[5/7] Collecting metrics from Azure Monitor..." -ForegroundColor Yellow
+Write-Host "   This may take a few minutes..." -ForegroundColor Gray
+
+$appMetrics = @()
+
+foreach ($app in $appsOnDedicated) {
+    Write-Host "   Processing: $($app.name)..." -ForegroundColor Gray
+    
+    $appResourceId = $app.id
+    $profileName = $app.properties.workloadProfileName
+    
+    # Get CPU metrics
+    $cpuMetrics = Get-ACAMetrics `
+        -ResourceId $appResourceId `
+        -MetricName "UsageNanoCores" `
+        -StartTime $StartDate `
+        -EndTime $EndDate `
+        -Aggregation "Average"
+    
+    # Get Memory metrics
+    $memoryMetrics = Get-ACAMetrics `
+        -ResourceId $appResourceId `
+        -MetricName "WorkingSetBytes" `
+        -StartTime $StartDate `
+        -EndTime $EndDate `
+        -Aggregation "Average"
+    
+    # Get Replica count metrics
+    $replicaMetrics = Get-ACAMetrics `
+        -ResourceId $appResourceId `
+        -MetricName "Replicas" `
+        -StartTime $StartDate `
+        -EndTime $EndDate `
+        -Aggregation "Average"
+    
+    # Calculate totals
+    $avgCpuNanoCores = ($cpuMetrics | Measure-Object -Property value -Average).Average
+    if (-not $avgCpuNanoCores) { $avgCpuNanoCores = 0 }
+    
+    $avgMemoryBytes = ($memoryMetrics | Measure-Object -Property value -Average).Average
+    if (-not $avgMemoryBytes) { $avgMemoryBytes = 0 }
+    
+    $avgReplicas = ($replicaMetrics | Measure-Object -Property value -Average).Average
+    if (-not $avgReplicas) { $avgReplicas = 0 }
+    
+    # Calculate replica-hours (average replicas * hours in period)
+    $periodHours = ($EndDate - $StartDate).TotalHours
+    $replicaHours = $avgReplicas * $periodHours
+    
+    # Store metrics
+    $appMetrics += [PSCustomObject]@{
+        AppName = $app.name
+        WorkloadProfile = $profileName
+        AvgCpuNanoCores = $avgCpuNanoCores
+        AvgCpuCores = $avgCpuNanoCores / 1000000000
+        AvgMemoryBytes = $avgMemoryBytes
+        AvgMemoryGiB = $avgMemoryBytes / 1073741824
+        AvgReplicas = $avgReplicas
+        ReplicaHours = $replicaHours
+        ResourceId = $appResourceId
+    }
+    
+    Write-Host "     ✓ CPU: $([Math]::Round($avgCpuNanoCores / 1000000000, 3)) cores, Memory: $([Math]::Round($avgMemoryBytes / 1073741824, 2)) GiB, Replicas: $([Math]::Round($avgReplicas, 2))" -ForegroundColor Gray
+}
+
+Write-Host "   ✓ Metrics collection complete" -ForegroundColor Green
+
+# Step 6: Calculate Cost Allocation
+Write-Host "[6/7] Calculating cost allocation..." -ForegroundColor Yellow
+
+# Calculate totals per workload profile
+$profileTotals = @{}
+$profileCostWeights = @{}
+
+foreach ($profile in $dedicatedProfiles) {
+    $appsOnProfile = $appMetrics | Where-Object { $_.WorkloadProfile -eq $profile.name }
+    
+    $totalCpu = ($appsOnProfile | Measure-Object -Property AvgCpuNanoCores -Sum).Sum
+    $totalMemory = ($appsOnProfile | Measure-Object -Property AvgMemoryBytes -Sum).Sum
+    $totalReplicaHours = ($appsOnProfile | Measure-Object -Property ReplicaHours -Sum).Sum
+    
+    # Get cost weight for this profile type
+    $costWeight = Get-ProfileCostWeight -ProfileType $profile.workloadProfileType
+    if ($null -eq $costWeight) {
+        Write-Warning "Unknown workload profile type: $($profile.workloadProfileType) for profile $($profile.name). Skipping."
+        continue
+    }
+    
+    $profileTotals[$profile.name] = @{
+        TotalCpu = $totalCpu
+        TotalMemory = $totalMemory
+        TotalReplicaHours = $totalReplicaHours
+    }
+    
+    $profileCostWeights[$profile.name] = $costWeight
+}
+
+# Calculate percentage allocation for each app (within its profile)
+$results = @()
+foreach ($app in $appMetrics) {
+    $totals = $profileTotals[$app.WorkloadProfile]
+    
+    # Calculate individual percentages within this profile
+    $cpuPercent = if ($totals.TotalCpu -gt 0) { ($app.AvgCpuNanoCores / $totals.TotalCpu) * 100 } else { 0 }
+    $memoryPercent = if ($totals.TotalMemory -gt 0) { ($app.AvgMemoryBytes / $totals.TotalMemory) * 100 } else { 0 }
+    $replicaPercent = if ($totals.TotalReplicaHours -gt 0) { ($app.ReplicaHours / $totals.TotalReplicaHours) * 100 } else { 0 }
+    
+    # Calculate weighted allocation percentage (within profile)
+    $profileAllocationPercent = ($cpuPercent * $CpuWeight) + ($memoryPercent * $MemoryWeight) + ($replicaPercent * $ReplicaTimeWeight)
+    
+    $results += [PSCustomObject]@{
+        AppName = $app.AppName
+        WorkloadProfile = $app.WorkloadProfile
+        ProfileCostWeight = $profileCostWeights[$app.WorkloadProfile]
+        AvgCpuCores = [Math]::Round($app.AvgCpuCores, 3)
+        AvgMemoryGiB = [Math]::Round($app.AvgMemoryGiB, 2)
+        AvgReplicas = [Math]::Round($app.AvgReplicas, 2)
+        ReplicaHours = [Math]::Round($app.ReplicaHours, 2)
+        CpuUsagePercent = [Math]::Round($cpuPercent, 2)
+        MemoryUsagePercent = [Math]::Round($memoryPercent, 2)
+        ReplicaTimePercent = [Math]::Round($replicaPercent, 2)
+        ProfileAllocationPercent = [Math]::Round($profileAllocationPercent, 2)
+    }
+}
+
+# Calculate environment-wide allocation (normalized by profile cost weights)
+$totalWeightedCost = 0
+foreach ($app in $results) {
+    $app | Add-Member -NotePropertyName "WeightedCost" -NotePropertyValue ($app.ProfileAllocationPercent * $app.ProfileCostWeight / 100)
+    $totalWeightedCost += $app.WeightedCost
+}
+
+# Add environment-wide percentage
+foreach ($app in $results) {
+    $envWidePercent = if ($totalWeightedCost -gt 0) { ($app.WeightedCost / $totalWeightedCost) * 100 } else { 0 }
+    $app | Add-Member -NotePropertyName "EnvironmentCostPercent" -NotePropertyValue ([Math]::Round($envWidePercent, 2))
+}
+
+Write-Host "   ✓ Cost allocation calculated" -ForegroundColor Green
+
+# Step 7: Output Results
+Write-Host "[7/7] Generating report..." -ForegroundColor Yellow
+
+# Display summary
+Write-Host ""
+Write-Host "===== COST ALLOCATION RESULTS =====" -ForegroundColor Cyan
+Write-Host ""
+
+# Show per-profile breakdown
+foreach ($profile in $dedicatedProfiles) {
+    $appsOnProfile = $results | Where-Object { $_.WorkloadProfile -eq $profile.name }
+    
+    if ($appsOnProfile.Count -gt 0) {
+        $profileCostWeight = $profileCostWeights[$profile.name]
+        
+        Write-Host "Workload Profile: $($profile.name) ($($profile.workloadProfileType), Cost Weight: $profileCostWeight)" -ForegroundColor Yellow
+        Write-Host ""
+        
+        $appsOnProfile | Sort-Object ProfileAllocationPercent -Descending | ForEach-Object {
+            Write-Host "  $($_.AppName)" -ForegroundColor White
+            Write-Host "    Profile Allocation: $($_.ProfileAllocationPercent)%" -ForegroundColor Cyan
+            Write-Host "    Environment-Wide Cost: $($_.EnvironmentCostPercent)%" -ForegroundColor Green
+            Write-Host "    - CPU Usage: $($_.CpuUsagePercent)% ($($_.AvgCpuCores) cores avg)" -ForegroundColor Gray
+            Write-Host "    - Memory Usage: $($_.MemoryUsagePercent)% ($($_.AvgMemoryGiB) GiB avg)" -ForegroundColor Gray
+            Write-Host "    - Replica Time: $($_.ReplicaTimePercent)% ($($_.ReplicaHours) replica-hours)" -ForegroundColor Gray
+            Write-Host ""
+        }
+        
+        $totalProfileAllocation = ($appsOnProfile | Measure-Object -Property ProfileAllocationPercent -Sum).Sum
+        $totalEnvAllocation = ($appsOnProfile | Measure-Object -Property EnvironmentCostPercent -Sum).Sum
+        Write-Host "  Profile Total: $([Math]::Round($totalProfileAllocation, 2))% | Environment Total: $([Math]::Round($totalEnvAllocation, 2))%" -ForegroundColor Green
+        Write-Host ""
+    }
+}
+
+# Show environment-wide summary
+if ($dedicatedProfiles.Count -gt 1) {
+    Write-Host "===== ENVIRONMENT-WIDE SUMMARY =====" -ForegroundColor Cyan
+    Write-Host ""
+    $results | Sort-Object EnvironmentCostPercent -Descending | ForEach-Object {
+        Write-Host "  $($_.AppName) ($($_.WorkloadProfile)): $($_.EnvironmentCostPercent)%" -ForegroundColor White
+    }
+    $totalEnvCost = ($results | Measure-Object -Property EnvironmentCostPercent -Sum).Sum
+    Write-Host ""
+    Write-Host "  Total Environment Cost: $([Math]::Round($totalEnvCost, 2))%" -ForegroundColor Green
+    Write-Host ""
+}
+
+# Export to CSV
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$outputFile = Join-Path $OutputPath "ACA-CostBreakdown-$EnvironmentName-$timestamp.csv"
+
+try {
+    $results | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "✓ Results exported to: $outputFile" -ForegroundColor Green
+} catch {
+    Write-Warning "Failed to export CSV: $_"
+}
+
+# Validation check
+Write-Host ""
+Write-Host "===== VALIDATION =====" -ForegroundColor Cyan
+
+# Validate per-profile allocations
+foreach ($profile in $dedicatedProfiles) {
+    $appsOnProfile = $results | Where-Object { $_.WorkloadProfile -eq $profile.name }
+    if ($appsOnProfile.Count -gt 0) {
+        $totalAllocation = ($appsOnProfile | Measure-Object -Property ProfileAllocationPercent -Sum).Sum
+        $status = if ([Math]::Abs($totalAllocation - 100) -lt 0.1) { "✓" } else { "⚠" }
+        Write-Host "$status Profile '$($profile.name)' allocation: $([Math]::Round($totalAllocation, 2))%" -ForegroundColor $(if ($status -eq "✓") { "Green" } else { "Yellow" })
+    }
+}
+
+# Validate environment-wide allocation
+$totalEnvAllocation = ($results | Measure-Object -Property EnvironmentCostPercent -Sum).Sum
+$envStatus = if ([Math]::Abs($totalEnvAllocation - 100) -lt 0.1) { "✓" } else { "⚠" }
+Write-Host "$envStatus Environment-wide total allocation: $([Math]::Round($totalEnvAllocation, 2))%" -ForegroundColor $(if ($envStatus -eq "✓") { "Green" } else { "Yellow" })ry {
+    $results | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "✓ Results exported to: $outputFile" -ForegroundColor Green
+} catch {
+    Write-Warning "Failed to export CSV: $_"
+}
+
+# Validation check
+Write-Host ""
+Write-Host "===== VALIDATION =====" -ForegroundColor Cyan
+foreach ($profile in $dedicatedProfiles) {
+    $appsOnProfile = $results | Where-Object { $_.WorkloadProfile -eq $profile.name }
+    if ($appsOnProfile.Count -gt 0) {
+        $totalAllocation = ($appsOnProfile | Measure-Object -Property AllocatedCostPercent -Sum).Sum
+        $status = if ([Math]::Abs($totalAllocation - 100) -lt 0.1) { "✓" } else { "⚠" }
+        Write-Host "$status Profile '$($profile.name)' total allocation: $([Math]::Round($totalAllocation, 2))%" -ForegroundColor $(if ($status -eq "✓") { "Green" } else { "Yellow" })
+    }
+}
+
+Write-Host ""
+Write-Host "Analysis complete!" -ForegroundColor Green

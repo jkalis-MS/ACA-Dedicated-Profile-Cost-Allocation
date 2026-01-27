@@ -1,0 +1,23 @@
+# PowerShell
+*.ps1xml
+
+# Output files
+*.csv
+ACA-CostBreakdown-*.csv
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Config files with secrets (keep .example files)
+config.json
+appsettings.json
