@@ -42,57 +42,8 @@ az login
     -EnvironmentName "your-container-app-env"
 ```
 
-### Example Output
+### Custom Time Range
 
-```
-Workload Profile: production-d8 (D8, Cost Weight: 2.0)
-
-  api-service
-    Profile Allocation: 65.43%
-    Environment-Wide Cost: 45.62%
-    - CPU Usage: 70.25% (2.1 cores avg)
-    - Memory Usage: 58.32% (9.3 GiB avg)
-    - Replica Time: 60.00% (144 replica-hours)
-```
-
-Results are exported to CSV: `ACA-CostBreakdown-{env}-{timestamp}.csv`
-
-## Cost Allocation Formula
-
-**Per Profile:**
-```
-App % = (CPU% × 0.6) + (Memory% × 0.3) + (ReplicaTime% × 0.1)
-```
-
-**Environment-Wide (Multiple Profiles):**
-```
-App % = Profile Cost Weight × App Profile % / Total Weighted Cost
-```
-
-### SKU Cost Weights
-
-| SKU | vCPU | RAM | Weight | Monthly Cost* |
-|-----|------|-----|--------|---------------|
-| D4  | 4    | 16  | 1.00   | ~$225         |
-| D8  | 8    | 32  | 2.00   | ~$450         |
-| D16 | 16   | 64  | 4.00   | ~$899         |
-| D32 | 32   | 128 | 8.00   | ~$1,798       |
-| E4  | 4    | 32  | 1.26   | ~$283         |
-| E8  | 8    | 64  | 2.52   | ~$566         |
-| E16 | 16   | 128 | 5.04   | ~$1,132       |
-| E32 | 32   | 256 | 10.07  | ~$2,264       |
-
-*Approximate USD pricing
-
-## Documentation
-
-📘 **[CUSTOMER_GUIDE.md](CUSTOMER_GUIDE.md)** - Complete user guide with examples  
-⚡ **[QUICKSTART.md](QUICKSTART.md)** - 5-minute setup guide  
-📊 **[EXAMPLE.md](EXAMPLE.md)** - Detailed walkthrough with sample data  
-
-## Advanced Usage
-
-### Custom Time Range (Last 7 Days)
 ```powershell
 .\Get-ACAEnvironmentCostBreakdown.ps1 `
     -SubscriptionId $subId `
