@@ -83,7 +83,7 @@ Profile: dedicated-d4 (D4)
 ✓ Results exported to: .\ACA-CostBreakdown-my-env-20260204-143052.csv
 ```
 
-## Calculating Actual Costs
+## Calculating Actual Costs (Manual next step)
 
 1. Get profile costs from **Azure Portal → Cost Management → Cost Analysis**
 2. Filter by your Container Apps Environment
