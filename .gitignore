@@ -22,3 +22,6 @@ Thumbs.db
 config.json
 appsettings.json
 COST_MODEL_PROPOSAL.md
+
+# Git ignore itself
+.gitignore
