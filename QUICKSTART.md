@@ -22,39 +22,36 @@ Install-Module -Name Az.Accounts -Scope CurrentUser -Force
 
 ```powershell
 # 1. Login to Azure
-Connect-AzAccount
 az login
 
-# 2. Run the script (replace with your values)
+# 2. Run the script
 .\Get-ACAEnvironmentCostBreakdown.ps1 `
     -SubscriptionId "YOUR-SUBSCRIPTION-ID" `
-    -ResourceGroupName "YOUR-RESOURCE-GROUP" `
     -EnvironmentName "YOUR-ENVIRONMENT-NAME"
 ```
 
 ## What You Need
 
-To run the script, provide these three values:
+To run the script, provide these values:
 
-1. **Subscription ID**: Find in Azure Portal → Subscriptions
-2. **Resource Group**: The RG containing your Container App Environment
-3. **Environment Name**: Your Container Apps Environment name
+1. **Subscription ID** (required): Find in Azure Portal → Subscriptions
+2. **Environment Name** (required): Your Container Apps Environment name
+
+> **Note:** The script automatically discovers apps across all resource groups targeting the environment.
 
 ## Quick Test
 
 ```powershell
-# Test with last 24 hours (default)
+# Basic run
 .\Get-ACAEnvironmentCostBreakdown.ps1 `
     -SubscriptionId "12345678-1234-1234-1234-123456789abc" `
-    -ResourceGroupName "my-rg" `
     -EnvironmentName "my-aca-env"
 
-# Test with last 7 days
+# With custom weights
 .\Get-ACAEnvironmentCostBreakdown.ps1 `
     -SubscriptionId "12345678-1234-1234-1234-123456789abc" `
-    -ResourceGroupName "my-rg" `
     -EnvironmentName "my-aca-env" `
-    -StartDate (Get-Date).AddDays(-7)
+    -CpuWeight 0.85 -MemoryWeight 0.15
 ```
 
 ## Expected Output
@@ -63,8 +60,8 @@ The script will:
 1. ✓ Connect to Azure
 2. ✓ Find your Container Apps Environment
 3. ✓ List workload profiles (must have Dedicated profiles)
-4. ✓ List container apps using those profiles
-5. ✓ Collect CPU/memory/replica metrics
+4. ✓ List container apps using those profiles (all resource groups)
+5. ✓ Collect reserved capacity (CPU × replicas, Memory × replicas)
 6. ✓ Calculate cost allocation percentages
 7. ✓ Export CSV report
 8. ✓ Display summary on screen
@@ -73,18 +70,20 @@ The script will:
 
 **"Not logged in to Azure"**
 ```powershell
-Connect-AzAccount
 az login
 ```
+
+**"Environment not found"**
+- Check the environment name is correct
+- Verify the subscription ID
 
 **"No dedicated workload profiles found"**
 - Your environment uses only Consumption profiles
 - This tool is for Dedicated profiles only
 
-**"Failed to retrieve metrics"**
-- Wait a few minutes after app deployment for metrics to appear
-- Check that apps were actually running during the time period
-- Verify you have Monitoring Reader role
+**Apps showing 0% allocation**
+- Check that minReplicas > 0 for your apps
+- Apps with minReplicas=0 don't reserve capacity
 
 ## Next Steps
 

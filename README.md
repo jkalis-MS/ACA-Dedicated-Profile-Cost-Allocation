@@ -8,12 +8,12 @@ When multiple Container Apps share Dedicated Workload Profiles (D4, D8, E4, etc.
 
 ### Key Features
 
-✅ **Two allocation modes** - Reserved (configured) or Actual (real usage)  
-✅ **Pricing-based allocation** - Weights derived from actual Azure pricing ($0.0571/vCPU, $0.0050/GiB)  
-✅ **3-step cost model** - Resource cost share × replica time usage  
+✅ **Reserved capacity allocation** - Uses configured CPU/Memory × minReplicas  
+✅ **Cross-resource group support** - Analyzes all apps in an environment, regardless of RG  
+✅ **Pricing-based weights** - Derived from Azure pricing ($0.0571/vCPU, $0.0050/GiB)  
 ✅ Multi-profile cost allocation with SKU-aware weighting  
 ✅ CSV export with detailed metrics  
-✅ Pure PowerShell - no compiled code  
+✅ Pure PowerShell - no Azure Monitor calls needed  
 ✅ Works with Azure CLI authentication  
 
 ## Quick Start
@@ -40,7 +40,6 @@ az login
 ```powershell
 .\Get-ACAEnvironmentCostBreakdown.ps1 `
     -SubscriptionId "your-subscription-id" `
-    -ResourceGroupName "your-resource-group" `
     -EnvironmentName "your-container-app-env"
 ```
 ### Custom Allocation Weights
@@ -60,8 +59,8 @@ az login
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `SubscriptionId` | ✓ | - | Azure Subscription ID |
-| `ResourceGroupName` | ✓ | - | Resource Group name |
 | `EnvironmentName` | ✓ | - | Container Apps Environment name |
+| `ResourceGroupName` | | (discovered) | Resource Group name (optional - evaluating all Container Apps for provided Environment if not provided) |
 | `StartDate` | | 24h ago | Analysis start time |
 | `EndDate` | | Now | Analysis end time |
 | `AllocationMode` | | Reserved | `Reserved` = configured resources, `Actual` = real usage |
@@ -86,14 +85,14 @@ See [CUSTOMER_GUIDE.md](CUSTOMER_GUIDE.md#troubleshooting) for detailed troubles
 ## How It Works
 
 The script:
-1. Retrieves environment configuration via `az containerapp env show`
+1. Discovers environment by name across the subscription
 2. Extracts workload profiles with SKU types from environment properties
-3. Collects CPU, memory, and replica metrics from Azure Monitor
-4. Calculates cost allocation using the 3-step model (see below)
-5. Applies SKU cost weights for environment-wide allocation
+3. Lists all container apps targeting the environment (any resource group)
+4. Reads configured CPU/Memory and minReplicas from each app
+5. Calculates cost allocation using the 3-step model
 6. Exports detailed CSV report
 
-**SKU Detection:** Uses `workloadProfileType` property from Azure, ensuring accurate cost weight application without relying on naming conventions.
+**No Azure Monitor Required:** Uses app configuration data directly, making it faster and simpler.
 
 ## Cost Allocation Model
 
