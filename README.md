@@ -8,8 +8,10 @@ When multiple Container Apps share Dedicated Workload Profiles (D4, D8, E4, etc.
 
 ### Key Features
 
+✅ **Two allocation modes** - Reserved (configured) or Actual (real usage)  
+✅ **Pricing-based allocation** - Weights derived from actual Azure pricing ($0.0571/vCPU, $0.0050/GiB)  
+✅ **3-step cost model** - Resource cost share × replica time usage  
 ✅ Multi-profile cost allocation with SKU-aware weighting  
-✅ Configurable allocation formula (CPU, memory, replica-time)  
 ✅ CSV export with detailed metrics  
 ✅ Pure PowerShell - no compiled code  
 ✅ Works with Azure CLI authentication  
@@ -43,8 +45,9 @@ az login
 ```
 ### Custom Allocation Weights
 ```powershell
-# CPU-heavy weighting
--CpuWeight 0.7 -MemoryWeight 0.2 -ReplicaTimeWeight 0.1
+# Default weights are based on Azure pricing ($0.0571/vCPU, $0.0050/GiB)
+# CPU=0.92, Memory=0.08 - adjust if needed
+-CpuWeight 0.85 -MemoryWeight 0.15
 ```
 
 ### Analyze Only Dedicated Profiles
@@ -61,13 +64,13 @@ az login
 | `EnvironmentName` | ✓ | - | Container Apps Environment name |
 | `StartDate` | | 24h ago | Analysis start time |
 | `EndDate` | | Now | Analysis end time |
-| `CpuWeight` | | 0.6 | CPU usage weight (0-1) |
-| `MemoryWeight` | | 0.3 | Memory usage weight (0-1) |
-| `ReplicaTimeWeight` | | 0.1 | Replica runtime weight (0-1) |
+| `AllocationMode` | | Reserved | `Reserved` = configured resources, `Actual` = real usage |
+| `CpuWeight` | | 0.92 | CPU usage weight (based on $0.0571/vCPU-hour) |
+| `MemoryWeight` | | 0.08 | Memory usage weight (based on $0.0050/GiB-hour) |
 | `OnlyDedicated` | | $true | Skip Consumption profiles |
 | `OutputPath` | | ./ | CSV output directory |
 
-**Note:** Weights must sum to 1.0
+**Note:** CPU + Memory weights must sum to 1.0. Replica time is used as a multiplier (see Cost Allocation Model below).
 
 ## Troubleshooting
 
@@ -86,11 +89,33 @@ The script:
 1. Retrieves environment configuration via `az containerapp env show`
 2. Extracts workload profiles with SKU types from environment properties
 3. Collects CPU, memory, and replica metrics from Azure Monitor
-4. Calculates weighted allocation percentages per profile
+4. Calculates cost allocation using the 3-step model (see below)
 5. Applies SKU cost weights for environment-wide allocation
 6. Exports detailed CSV report
 
 **SKU Detection:** Uses `workloadProfileType` property from Azure, ensuring accurate cost weight application without relying on naming conventions.
+
+## Cost Allocation Model
+
+The tool uses a **3-step resource-cost weighted model** that reflects actual Azure pricing:
+
+| Meter | Azure Price | Weight |
+|-------|-------------|--------|
+| vCPU | $0.0571/hour | 0.92 (92%) |
+| Memory (GiB) | $0.0050/hour | 0.08 (8%) |
+
+**Allocation Formula:**
+
+```
+Step 1: ResourceCostShare = (CPU% × 0.92) + (Memory% × 0.08)
+Step 2: FinalCostShare = ResourceCostShare × ReplicaTime%
+Step 3: ProfileAllocation = Normalize to 100%
+```
+
+**Why this model?**
+- **Pricing-based weights**: CPU costs ~11x more than memory per unit
+- **Replica time as multiplier**: An app running 50% of the time pays 50% of its resource-proportional cost
+- **Fair allocation**: Apps are charged based on both *what resources they use* and *how long they use them*
 
 ## Limitations
 

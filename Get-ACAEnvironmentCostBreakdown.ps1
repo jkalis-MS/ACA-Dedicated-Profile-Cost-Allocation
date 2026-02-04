@@ -22,14 +22,24 @@
 .PARAMETER EndDate
     End date for metric collection (default: now)
     
+.PARAMETER AllocationMode
+    How to calculate resource usage for cost allocation (default: Reserved)
+    - Reserved: Uses configured CPU/Memory from container app settings (recommended)
+                Apps pay for what they reserve, regardless of actual usage
+    - Actual:   Uses actual CPU/Memory consumption from Azure Monitor
+                Apps pay based on real resource consumption
+    
 .PARAMETER CpuWeight
-    Weight for CPU usage in allocation formula (default: 0.6)
+    Weight for CPU usage in allocation formula (default: 0.92)
+    Based on Azure pricing: $0.0571/vCPU-hour
     
 .PARAMETER MemoryWeight
-    Weight for memory usage in allocation formula (default: 0.3)
+    Weight for memory usage in allocation formula (default: 0.08)
+    Based on Azure pricing: $0.0050/GiB-hour
     
 .PARAMETER ReplicaTimeWeight
-    Weight for replica runtime in allocation formula (default: 0.1)
+    DEPRECATED: Replica time is now used as a multiplier, not an additive weight.
+    This parameter is kept for backward compatibility but ignored in the new model.
     
 .PARAMETER OutputPath
     Path for output CSV file (default: current directory)
@@ -59,16 +69,20 @@ param(
     [DateTime]$EndDate = (Get-Date),
     
     [Parameter(Mandatory = $false)]
-    [ValidateRange(0, 1)]
-    [double]$CpuWeight = 0.6,
+    [ValidateSet("Reserved", "Actual")]
+    [string]$AllocationMode = "Reserved",
     
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 1)]
-    [double]$MemoryWeight = 0.3,
+    [double]$CpuWeight = 0.92,
     
     [Parameter(Mandatory = $false)]
     [ValidateRange(0, 1)]
-    [double]$ReplicaTimeWeight = 0.1,
+    [double]$MemoryWeight = 0.08,
+    
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 1)]
+    [double]$ReplicaTimeWeight = 0.0,  # Deprecated: now used as multiplier
     
     [Parameter(Mandatory = $false)]
     [switch]$OnlyDedicated = $true,
@@ -118,11 +132,15 @@ function Get-ProfileCostWeight {
     return $null
 }
 
-# Validate weights sum to 1.0
-$totalWeight = $CpuWeight + $MemoryWeight + $ReplicaTimeWeight
+# Validate CPU + Memory weights sum to 1.0 (ReplicaTimeWeight is deprecated)
+$totalWeight = $CpuWeight + $MemoryWeight
 if ([Math]::Abs($totalWeight - 1.0) -gt 0.001) {
-    Write-Error "Weights must sum to 1.0. Current sum: $totalWeight"
+    Write-Error "CPU and Memory weights must sum to 1.0. Current sum: $totalWeight"
     exit 1
+}
+
+if ($ReplicaTimeWeight -gt 0) {
+    Write-Warning "ReplicaTimeWeight parameter is deprecated. Replica time is now used as a multiplier in the 3-step allocation model."
 }
 
 Write-Host "===== Azure Container Apps Cost Breakdown Tool =====" -ForegroundColor Cyan
@@ -130,7 +148,8 @@ Write-Host "Subscription: $SubscriptionId" -ForegroundColor Gray
 Write-Host "Resource Group: $ResourceGroupName" -ForegroundColor Gray
 Write-Host "Environment: $EnvironmentName" -ForegroundColor Gray
 Write-Host "Analysis Period: $($StartDate.ToString('yyyy-MM-dd HH:mm')) to $($EndDate.ToString('yyyy-MM-dd HH:mm'))" -ForegroundColor Gray
-Write-Host "Allocation Weights: CPU=$CpuWeight, Memory=$MemoryWeight, ReplicaTime=$ReplicaTimeWeight" -ForegroundColor Gray
+Write-Host "Allocation Mode: $AllocationMode ($(if ($AllocationMode -eq 'Reserved') { 'configured resources' } else { 'actual usage from Azure Monitor' }))" -ForegroundColor Gray
+Write-Host "Allocation Weights: CPU=$CpuWeight, Memory=$MemoryWeight (ReplicaTime used as multiplier)" -ForegroundColor Gray
 Write-Host "Analyze Only Dedicated Profiles: $OnlyDedicated" -ForegroundColor Gray
 Write-Host ""
 
@@ -310,72 +329,137 @@ try {
 }
 
 # Step 5: Collect Metrics
-Write-Host "[5/7] Collecting metrics from Azure Monitor..." -ForegroundColor Yellow
-Write-Host "   This may take a few minutes..." -ForegroundColor Gray
-
 $appMetrics = @()
+$periodHours = ($EndDate - $StartDate).TotalHours
 
-foreach ($app in $appsOnDedicated) {
-    Write-Host "   Processing: $($app.name)..." -ForegroundColor Gray
+if ($AllocationMode -eq "Reserved") {
+    Write-Host "[5/7] Collecting reserved capacity from app configurations..." -ForegroundColor Yellow
     
-    $appResourceId = $app.id
-    $profileName = $app.properties.workloadProfileName
-    
-    # Get CPU metrics
-    $cpuMetrics = Get-ACAMetrics `
-        -ResourceId $appResourceId `
-        -MetricName "UsageNanoCores" `
-        -StartTime $StartDate `
-        -EndTime $EndDate `
-        -Aggregation "Average"
-    
-    # Get Memory metrics
-    $memoryMetrics = Get-ACAMetrics `
-        -ResourceId $appResourceId `
-        -MetricName "WorkingSetBytes" `
-        -StartTime $StartDate `
-        -EndTime $EndDate `
-        -Aggregation "Average"
-    
-    # Get Replica count metrics
-    $replicaMetrics = Get-ACAMetrics `
-        -ResourceId $appResourceId `
-        -MetricName "Replicas" `
-        -StartTime $StartDate `
-        -EndTime $EndDate `
-        -Aggregation "Average"
-    
-    # Calculate totals
-    $avgCpuNanoCores = ($cpuMetrics | Measure-Object -Property value -Average).Average
-    if (-not $avgCpuNanoCores) { $avgCpuNanoCores = 0 }
-    
-    $avgMemoryBytes = ($memoryMetrics | Measure-Object -Property value -Average).Average
-    if (-not $avgMemoryBytes) { $avgMemoryBytes = 0 }
-    
-    $avgReplicas = ($replicaMetrics | Measure-Object -Property value -Average).Average
-    if (-not $avgReplicas) { $avgReplicas = 0 }
-    
-    # Calculate replica-hours (average replicas * hours in period)
-    $periodHours = ($EndDate - $StartDate).TotalHours
-    $replicaHours = $avgReplicas * $periodHours
-    
-    # Store metrics
-    $appMetrics += [PSCustomObject]@{
-        AppName = $app.name
-        WorkloadProfile = $profileName
-        AvgCpuNanoCores = $avgCpuNanoCores
-        AvgCpuCores = $avgCpuNanoCores / 1000000000
-        AvgMemoryBytes = $avgMemoryBytes
-        AvgMemoryGiB = $avgMemoryBytes / 1073741824
-        AvgReplicas = $avgReplicas
-        ReplicaHours = $replicaHours
-        ResourceId = $appResourceId
+    foreach ($app in $appsOnDedicated) {
+        Write-Host "   Processing: $($app.name)..." -ForegroundColor Gray
+        
+        $appResourceId = $app.id
+        $profileName = $app.properties.workloadProfileName
+        
+        # Get configured (reserved) resources from app template
+        $containers = $app.properties.template.containers
+        $configuredCpuCores = 0
+        $configuredMemoryGiB = 0
+        
+        foreach ($container in $containers) {
+            # CPU is already in cores
+            $configuredCpuCores += [double]$container.resources.cpu
+            
+            # Memory can be in format "8Gi" or "8"
+            $memoryStr = $container.resources.memory
+            if ($memoryStr -match '^([\d.]+)Gi$') {
+                $configuredMemoryGiB += [double]$Matches[1]
+            } elseif ($memoryStr -match '^([\d.]+)$') {
+                $configuredMemoryGiB += [double]$Matches[1]
+            }
+        }
+        
+        # Get configured replica count from app scale settings (NOT from Azure Monitor)
+        $minReplicas = $app.properties.template.scale.minReplicas
+        if (-not $minReplicas) { $minReplicas = 0 }
+        
+        # For Reserved mode, we use minReplicas as the reserved capacity
+        # Apps reserve capacity based on their minimum guaranteed replicas
+        $configuredReplicas = [int]$minReplicas
+        
+        # Calculate replica-hours based on configured minReplicas for the full period
+        $replicaHours = $configuredReplicas * $periodHours
+        
+        # Reserved capacity = configured resources × configured minReplicas
+        $reservedCpuCores = $configuredCpuCores * $configuredReplicas
+        $reservedMemoryGiB = $configuredMemoryGiB * $configuredReplicas
+        
+        # Store metrics (using reserved capacity)
+        $appMetrics += [PSCustomObject]@{
+            AppName = $app.name
+            WorkloadProfile = $profileName
+            ConfiguredCpuCores = $configuredCpuCores
+            ConfiguredMemoryGiB = $configuredMemoryGiB
+            ConfiguredReplicas = $configuredReplicas
+            AvgCpuNanoCores = $reservedCpuCores * 1000000000  # Convert to nanocores for consistency
+            AvgCpuCores = $reservedCpuCores
+            AvgMemoryBytes = $reservedMemoryGiB * 1073741824  # Convert to bytes for consistency
+            AvgMemoryGiB = $reservedMemoryGiB
+            AvgReplicas = $configuredReplicas
+            ReplicaHours = $replicaHours
+            ResourceId = $appResourceId
+        }
+        
+        Write-Host "     ✓ Reserved: $configuredCpuCores cores × $configuredReplicas replicas (min) = $([Math]::Round($reservedCpuCores, 2)) core-replicas, $configuredMemoryGiB GiB × $configuredReplicas replicas = $([Math]::Round($reservedMemoryGiB, 2)) GiB-replicas" -ForegroundColor Gray
     }
     
-    Write-Host "     ✓ CPU: $([Math]::Round($avgCpuNanoCores / 1000000000, 3)) cores, Memory: $([Math]::Round($avgMemoryBytes / 1073741824, 2)) GiB, Replicas: $([Math]::Round($avgReplicas, 2))" -ForegroundColor Gray
+    Write-Host "   ✓ Reserved capacity collection complete (no Azure Monitor calls)" -ForegroundColor Green
+} else {
+    # Actual mode - use Azure Monitor metrics
+    Write-Host "[5/7] Collecting actual usage metrics from Azure Monitor..." -ForegroundColor Yellow
+    Write-Host "   This may take a few minutes..." -ForegroundColor Gray
+    
+    foreach ($app in $appsOnDedicated) {
+        Write-Host "   Processing: $($app.name)..." -ForegroundColor Gray
+        
+        $appResourceId = $app.id
+        $profileName = $app.properties.workloadProfileName
+        
+        # Get CPU metrics
+        $cpuMetrics = Get-ACAMetrics `
+            -ResourceId $appResourceId `
+            -MetricName "UsageNanoCores" `
+            -StartTime $StartDate `
+            -EndTime $EndDate `
+            -Aggregation "Average"
+        
+        # Get Memory metrics
+        $memoryMetrics = Get-ACAMetrics `
+            -ResourceId $appResourceId `
+            -MetricName "WorkingSetBytes" `
+            -StartTime $StartDate `
+            -EndTime $EndDate `
+            -Aggregation "Average"
+        
+        # Get Replica count metrics
+        $replicaMetrics = Get-ACAMetrics `
+            -ResourceId $appResourceId `
+            -MetricName "Replicas" `
+            -StartTime $StartDate `
+            -EndTime $EndDate `
+            -Aggregation "Average"
+        
+        # Calculate totals
+        $avgCpuNanoCores = ($cpuMetrics | Measure-Object -Property value -Average).Average
+        if (-not $avgCpuNanoCores) { $avgCpuNanoCores = 0 }
+        
+        $avgMemoryBytes = ($memoryMetrics | Measure-Object -Property value -Average).Average
+        if (-not $avgMemoryBytes) { $avgMemoryBytes = 0 }
+        
+        $avgReplicas = ($replicaMetrics | Measure-Object -Property value -Average).Average
+        if (-not $avgReplicas) { $avgReplicas = 0 }
+        
+        # Calculate replica-hours
+        $replicaHours = $avgReplicas * $periodHours
+        
+        # Store metrics
+        $appMetrics += [PSCustomObject]@{
+            AppName = $app.name
+            WorkloadProfile = $profileName
+            AvgCpuNanoCores = $avgCpuNanoCores
+            AvgCpuCores = $avgCpuNanoCores / 1000000000
+            AvgMemoryBytes = $avgMemoryBytes
+            AvgMemoryGiB = $avgMemoryBytes / 1073741824
+            AvgReplicas = $avgReplicas
+            ReplicaHours = $replicaHours
+            ResourceId = $appResourceId
+        }
+        
+        Write-Host "     ✓ Actual: $([Math]::Round($avgCpuNanoCores / 1000000000, 3)) cores, $([Math]::Round($avgMemoryBytes / 1073741824, 2)) GiB, $([Math]::Round($avgReplicas, 2)) replicas" -ForegroundColor Gray
+    }
+    
+    Write-Host "   ✓ Actual usage metrics collection complete" -ForegroundColor Green
 }
-
-Write-Host "   ✓ Metrics collection complete" -ForegroundColor Green
 
 # Step 6: Calculate Cost Allocation
 Write-Host "[6/7] Calculating cost allocation..." -ForegroundColor Yellow
@@ -407,8 +491,15 @@ foreach ($profile in $dedicatedProfiles) {
     $profileCostWeights[$profile.name] = $costWeight
 }
 
-# Calculate percentage allocation for each app (within its profile)
+# Calculate percentage allocation for each app using 3-step model:
+# Step 1: Calculate resource cost share (CPU% × 0.92 + Memory% × 0.08)
+# Step 2: Scale by replica time usage (multiply by replica time %)
+# Step 3: Normalize to 100%
+
 $results = @()
+$profileFinalCostShares = @{}  # Track totals for normalization
+
+# First pass: Calculate resource cost share and final cost share for each app
 foreach ($app in $appMetrics) {
     $totals = $profileTotals[$app.WorkloadProfile]
     
@@ -417,8 +508,17 @@ foreach ($app in $appMetrics) {
     $memoryPercent = if ($totals.TotalMemory -gt 0) { ($app.AvgMemoryBytes / $totals.TotalMemory) * 100 } else { 0 }
     $replicaPercent = if ($totals.TotalReplicaHours -gt 0) { ($app.ReplicaHours / $totals.TotalReplicaHours) * 100 } else { 0 }
     
-    # Calculate weighted allocation percentage (within profile)
-    $profileAllocationPercent = ($cpuPercent * $CpuWeight) + ($memoryPercent * $MemoryWeight) + ($replicaPercent * $ReplicaTimeWeight)
+    # Step 1: Calculate resource cost share (weighted by pricing: CPU=$0.0571, Memory=$0.0050)
+    $resourceCostShare = ($cpuPercent * $CpuWeight) + ($memoryPercent * $MemoryWeight)
+    
+    # Step 2: Scale by replica time usage (replica time as multiplier)
+    $finalCostShare = $resourceCostShare * ($replicaPercent / 100)
+    
+    # Track total for this profile for normalization
+    if (-not $profileFinalCostShares.ContainsKey($app.WorkloadProfile)) {
+        $profileFinalCostShares[$app.WorkloadProfile] = 0
+    }
+    $profileFinalCostShares[$app.WorkloadProfile] += $finalCostShare
     
     $results += [PSCustomObject]@{
         AppName = $app.AppName
@@ -431,7 +531,19 @@ foreach ($app in $appMetrics) {
         CpuUsagePercent = [Math]::Round($cpuPercent, 2)
         MemoryUsagePercent = [Math]::Round($memoryPercent, 2)
         ReplicaTimePercent = [Math]::Round($replicaPercent, 2)
-        ProfileAllocationPercent = [Math]::Round($profileAllocationPercent, 2)
+        ResourceCostShare = [Math]::Round($resourceCostShare, 2)
+        FinalCostShare = [Math]::Round($finalCostShare, 4)
+        ProfileAllocationPercent = 0  # Will be calculated in Step 3
+    }
+}
+
+# Step 3: Normalize to 100% within each profile
+foreach ($app in $results) {
+    $totalShare = $profileFinalCostShares[$app.WorkloadProfile]
+    if ($totalShare -gt 0) {
+        $app.ProfileAllocationPercent = [Math]::Round(($app.FinalCostShare / $totalShare) * 100, 2)
+    } else {
+        $app.ProfileAllocationPercent = 0
     }
 }
 
@@ -455,8 +567,11 @@ Write-Host "[7/7] Generating report..." -ForegroundColor Yellow
 
 # Display summary
 Write-Host ""
-Write-Host "===== COST ALLOCATION RESULTS =====" -ForegroundColor Cyan
+Write-Host "===== COST ALLOCATION RESULTS ($AllocationMode Mode) =====" -ForegroundColor Cyan
 Write-Host ""
+
+$cpuLabel = if ($AllocationMode -eq 'Reserved') { 'Reserved CPU' } else { 'Actual CPU' }
+$memLabel = if ($AllocationMode -eq 'Reserved') { 'Reserved Memory' } else { 'Actual Memory' }
 
 # Show per-profile breakdown
 foreach ($profile in $dedicatedProfiles) {
@@ -472,8 +587,8 @@ foreach ($profile in $dedicatedProfiles) {
             Write-Host "  $($_.AppName)" -ForegroundColor White
             Write-Host "    Profile Allocation: $($_.ProfileAllocationPercent)%" -ForegroundColor Cyan
             Write-Host "    Environment-Wide Cost: $($_.EnvironmentCostPercent)%" -ForegroundColor Green
-            Write-Host "    - CPU Usage: $($_.CpuUsagePercent)% ($($_.AvgCpuCores) cores avg)" -ForegroundColor Gray
-            Write-Host "    - Memory Usage: $($_.MemoryUsagePercent)% ($($_.AvgMemoryGiB) GiB avg)" -ForegroundColor Gray
+            Write-Host "    - $cpuLabel`: $($_.CpuUsagePercent)% ($($_.AvgCpuCores) cores)" -ForegroundColor Gray
+            Write-Host "    - $memLabel`: $($_.MemoryUsagePercent)% ($($_.AvgMemoryGiB) GiB)" -ForegroundColor Gray
             Write-Host "    - Replica Time: $($_.ReplicaTimePercent)% ($($_.ReplicaHours) replica-hours)" -ForegroundColor Gray
             Write-Host ""
         }
@@ -526,24 +641,7 @@ foreach ($profile in $dedicatedProfiles) {
 # Validate environment-wide allocation
 $totalEnvAllocation = ($results | Measure-Object -Property EnvironmentCostPercent -Sum).Sum
 $envStatus = if ([Math]::Abs($totalEnvAllocation - 100) -lt 0.1) { "✓" } else { "⚠" }
-Write-Host "$envStatus Environment-wide total allocation: $([Math]::Round($totalEnvAllocation, 2))%" -ForegroundColor $(if ($envStatus -eq "✓") { "Green" } else { "Yellow" })ry {
-    $results | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
-    Write-Host "✓ Results exported to: $outputFile" -ForegroundColor Green
-} catch {
-    Write-Warning "Failed to export CSV: $_"
-}
-
-# Validation check
-Write-Host ""
-Write-Host "===== VALIDATION =====" -ForegroundColor Cyan
-foreach ($profile in $dedicatedProfiles) {
-    $appsOnProfile = $results | Where-Object { $_.WorkloadProfile -eq $profile.name }
-    if ($appsOnProfile.Count -gt 0) {
-        $totalAllocation = ($appsOnProfile | Measure-Object -Property AllocatedCostPercent -Sum).Sum
-        $status = if ([Math]::Abs($totalAllocation - 100) -lt 0.1) { "✓" } else { "⚠" }
-        Write-Host "$status Profile '$($profile.name)' total allocation: $([Math]::Round($totalAllocation, 2))%" -ForegroundColor $(if ($status -eq "✓") { "Green" } else { "Yellow" })
-    }
-}
+Write-Host "$envStatus Environment-wide total allocation: $([Math]::Round($totalEnvAllocation, 2))%" -ForegroundColor $(if ($envStatus -eq "✓") { "Green" } else { "Yellow" })
 
 Write-Host ""
 Write-Host "Analysis complete!" -ForegroundColor Green

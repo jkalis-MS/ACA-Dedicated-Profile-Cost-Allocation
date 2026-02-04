@@ -21,3 +21,4 @@ Thumbs.db
 # Config files with secrets (keep .example files)
 config.json
 appsettings.json
+COST_MODEL_PROPOSAL.md
